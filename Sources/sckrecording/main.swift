@@ -8,6 +8,7 @@ import AVFoundation
 import CoreGraphics
 import ScreenCaptureKit
 import VideoToolbox
+import AudioToolbox
 
 enum RecordMode {
     case h264_sRGB
@@ -52,6 +53,7 @@ struct ScreenRecorder {
 
     private let assetWriter: AVAssetWriter
     private let videoInput: AVAssetWriterInput
+    private let audioInput: AVAssetWriterInput
     private let streamOutput: StreamOutput
     private var stream: SCStream
 
@@ -102,13 +104,29 @@ struct ScreenRecorder {
         // Create AVAssetWriter input for video, based on the output settings from the Assistant
         videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: outputSettings)
         videoInput.expectsMediaDataInRealTime = true
-        streamOutput = StreamOutput(videoInput: videoInput)
 
-        // Adding videoInput to assetWriter
+        // Create AVAssetWriter input for audio (encode to AAC)
+        let audioSettings: [String: Any] = [
+            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+            AVNumberOfChannelsKey: 2,
+            AVSampleRateKey: 44100,
+            AVEncoderBitRateKey: 192_000
+        ]
+        audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+        audioInput.expectsMediaDataInRealTime = true
+
+        streamOutput = StreamOutput(assetWriter: assetWriter, videoInput: videoInput, audioInput: audioInput)
+
+        // Adding inputs to assetWriter
         guard assetWriter.canAdd(videoInput) else {
-            throw RecordingError("Can't add input to asset writer")
+            throw RecordingError("Can't add video input to asset writer")
         }
         assetWriter.add(videoInput)
+
+        guard assetWriter.canAdd(audioInput) else {
+            throw RecordingError("Can't add audio input to asset writer")
+        }
+        assetWriter.add(audioInput)
 
         guard assetWriter.startWriting() else {
             if let error = assetWriter.error {
@@ -131,6 +149,8 @@ struct ScreenRecorder {
         // Increase the depth of the frame queue to ensure high fps at the expense of increasing
         // the memory footprint of WindowServer.
         configuration.queueDepth = 6 // 4 minimum, or it becomes very stuttery
+        configuration.showsCursor = true
+        configuration.capturesAudio = true
 
         // Make sure to take displayScaleFactor into account
         // otherwise, image is scaled up and gets blurry
@@ -160,6 +180,7 @@ struct ScreenRecorder {
         // Create SCStream and add local StreamOutput object to receive samples
         stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
         try stream.addStreamOutput(streamOutput, type: .screen, sampleHandlerQueue: videoSampleBufferQueue)
+        try stream.addStreamOutput(streamOutput, type: .audio, sampleHandlerQueue: videoSampleBufferQueue)
     }
 
     func start() async throws {
@@ -167,8 +188,7 @@ struct ScreenRecorder {
         // Start capturing, wait for stream to start
         try await stream.startCapture()
 
-        // Start the AVAssetWriter session at source time .zero, sample buffers will need to be re-timed
-        assetWriter.startSession(atSourceTime: .zero)
+        // Defer startSession until first sample buffer arrives for zero-copy path
         streamOutput.sessionStarted = true
     }
 
@@ -177,33 +197,27 @@ struct ScreenRecorder {
         // Stop capturing, wait for stream to stop
         try await stream.stopCapture()
 
-        // Repeat the last frame and add it at the current time
-        // In case no changes happend on screen, and the last frame is from long ago
-        // This ensures the recording is of the expected length
-        if let originalBuffer = streamOutput.lastSampleBuffer {
-            let additionalTime = CMTime(seconds: ProcessInfo.processInfo.systemUptime, preferredTimescale: 100) - streamOutput.firstSampleTime
-            let timing = CMSampleTimingInfo(duration: originalBuffer.duration, presentationTimeStamp: additionalTime, decodeTimeStamp: originalBuffer.decodeTimeStamp)
-            let additionalSampleBuffer = try CMSampleBuffer(copying: originalBuffer, withNewTiming: [timing])
-            videoInput.append(additionalSampleBuffer)
-            streamOutput.lastSampleBuffer = additionalSampleBuffer
-        }
-
-        // Stop the AVAssetWriter session at time of the repeated frame
+        // End the AVAssetWriter session at last received sample
         assetWriter.endSession(atSourceTime: streamOutput.lastSampleBuffer?.presentationTimeStamp ?? .zero)
 
         // Finish writing
         videoInput.markAsFinished()
+        audioInput.markAsFinished()
         await assetWriter.finishWriting()
     }
 
     private class StreamOutput: NSObject, SCStreamOutput {
+        let assetWriter: AVAssetWriter
         let videoInput: AVAssetWriterInput
+        let audioInput: AVAssetWriterInput
         var sessionStarted = false
-        var firstSampleTime: CMTime = .zero
+        private var baseTime: CMTime?
         var lastSampleBuffer: CMSampleBuffer?
 
-        init(videoInput: AVAssetWriterInput) {
+        init(assetWriter: AVAssetWriter, videoInput: AVAssetWriterInput, audioInput: AVAssetWriterInput) {
+            self.assetWriter = assetWriter
             self.videoInput = videoInput
+            self.audioInput = audioInput
         }
 
         func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -214,50 +228,31 @@ struct ScreenRecorder {
             // Return early if the sample buffer is invalid
             guard sampleBuffer.isValid else { return }
 
-            // Retrieve the array of metadata attachments from the sample buffer
-            guard let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
-                  let attachments = attachmentsArray.first
-            else { return }
-
-            // Validate the status of the frame. If it isn't `.complete`, return
-            guard let statusRawValue = attachments[SCStreamFrameInfo.status] as? Int,
-                  let status = SCFrameStatus(rawValue: statusRawValue),
-                  status == .complete
-            else { return }
-
+            // Start assetWriter session on first buffer (zero-copy)
+            if baseTime == nil {
+                baseTime = sampleBuffer.presentationTimeStamp
+                assetWriter.startSession(atSourceTime: baseTime!)
+            }
 
             switch type {
             case .screen:
+                // Validate that frame is complete to avoid tears
+                guard let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+                      let attachments = attachmentsArray.first,
+                      let statusRawValue = attachments[SCStreamFrameInfo.status] as? Int,
+                      let status = SCFrameStatus(rawValue: statusRawValue),
+                      status == .complete
+                else { return }
+
                 if videoInput.isReadyForMoreMediaData {
-                    // Save the timestamp of the current sample, all future samples will be offset by this
-                    if firstSampleTime == .zero {
-                        firstSampleTime = sampleBuffer.presentationTimeStamp
-                    }
-
-                    // Offset the time of the sample buffer, relative to the first sample
-                    let lastSampleTime = sampleBuffer.presentationTimeStamp - firstSampleTime
-
-                    // Always save the last sample buffer.
-                    // This is used to "fill up" empty space at the end of the recording.
-                    //
-                    // Note that this permanently captures one of the sample buffers
-                    // from the ScreenCaptureKit queue.
-                    // Make sure reserve enough in SCStreamConfiguration.queueDepth
-                    lastSampleBuffer = sampleBuffer
-
-                    // Create a new CMSampleBuffer by copying the original, and applying the new presentationTimeStamp
-                    let timing = CMSampleTimingInfo(duration: sampleBuffer.duration, presentationTimeStamp: lastSampleTime, decodeTimeStamp: sampleBuffer.decodeTimeStamp)
-                    if let retimedSampleBuffer = try? CMSampleBuffer(copying: sampleBuffer, withNewTiming: [timing]) {
-                        videoInput.append(retimedSampleBuffer)
-                    } else {
-                        print("Couldn't copy CMSampleBuffer, dropping frame")
-                    }
-                } else {
-                    print("AVAssetWriterInput isn't ready, dropping frame")
+                    videoInput.append(sampleBuffer)
+                    lastSampleBuffer = sampleBuffer // keep for endSession timing
                 }
 
             case .audio:
-                break
+                if audioInput.isReadyForMoreMediaData {
+                    audioInput.append(sampleBuffer)
+                }
 
             @unknown default:
                 break
