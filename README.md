@@ -18,8 +18,7 @@ See also: [AVCaptureScreenInput-Recording-example](https://github.com/nonstrict-
 
 ## Capture microphone
 
-- Works on macOS 15+. Mic audio is added as separate track (system audio = track 1, mic audio = track 2)
-- If you use QuickTime to playback the recording that has mic audio, enable "Prefer Passthrough"
+Works on macOS 15+. Before macOS 15, only system audio is captured.
 
 ## Authors
 
