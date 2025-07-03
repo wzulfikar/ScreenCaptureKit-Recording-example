@@ -53,7 +53,8 @@ struct ScreenRecorder {
 
     private let assetWriter: AVAssetWriter
     private let videoInput: AVAssetWriterInput
-    private let audioInput: AVAssetWriterInput
+    private let audioInput: AVAssetWriterInput // system audio
+    private var micInput: AVAssetWriterInput? // separate mic track (mono)
     private let streamOutput: StreamOutput
     private var stream: SCStream
 
@@ -105,7 +106,7 @@ struct ScreenRecorder {
         videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: outputSettings)
         videoInput.expectsMediaDataInRealTime = true
 
-        // Create AVAssetWriter input for audio (encode to AAC)
+        // Create AVAssetWriter input for system audio (encode to AAC)
         let audioSettings: [String: Any] = [
             AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
             AVNumberOfChannelsKey: 2,
@@ -115,7 +116,21 @@ struct ScreenRecorder {
         audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
         audioInput.expectsMediaDataInRealTime = true
 
-        streamOutput = StreamOutput(assetWriter: assetWriter, videoInput: videoInput, audioInput: audioInput)
+        // Create optional microphone track using same AAC settings (will be mono if mic supplies 1 ch)
+        if #available(macOS 15.0, *) {
+            // Use mono AAC for microphone track
+            let micSettings: [String: Any] = [
+                AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+                AVNumberOfChannelsKey: 1,  // mono for mic
+                AVSampleRateKey: 48000,  // match actual mic sample rate
+                AVEncoderBitRateKey: 96_000  // lower bitrate for mono
+            ]
+            let micWriterInput = AVAssetWriterInput(mediaType: .audio, outputSettings: micSettings)
+            micWriterInput.expectsMediaDataInRealTime = true
+            self.micInput = micWriterInput
+        }
+
+        streamOutput = StreamOutput(assetWriter: assetWriter, videoInput: videoInput, audioInput: audioInput, micInput: micInput)
 
         // Adding inputs to assetWriter
         guard assetWriter.canAdd(videoInput) else {
@@ -127,6 +142,10 @@ struct ScreenRecorder {
             throw RecordingError("Can't add audio input to asset writer")
         }
         assetWriter.add(audioInput)
+
+        if let micInput = micInput {
+            if assetWriter.canAdd(micInput) { assetWriter.add(micInput) }
+        }
 
         guard assetWriter.startWriting() else {
             if let error = assetWriter.error {
@@ -150,7 +169,14 @@ struct ScreenRecorder {
         // the memory footprint of WindowServer.
         configuration.queueDepth = 6 // 4 minimum, or it becomes very stuttery
         configuration.showsCursor = true
-        configuration.capturesAudio = true
+        configuration.capturesAudio = true  // system audio
+
+#if compiler(>=5.10)
+#endif
+        if #available(macOS 15.0, *) {
+            configuration.captureMicrophone = true
+            configuration.microphoneCaptureDeviceID = AVCaptureDevice.default(for: .audio)?.uniqueID
+        }
 
         // Make sure to take displayScaleFactor into account
         // otherwise, image is scaled up and gets blurry
@@ -181,10 +207,14 @@ struct ScreenRecorder {
         stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
         try stream.addStreamOutput(streamOutput, type: .screen, sampleHandlerQueue: videoSampleBufferQueue)
         try stream.addStreamOutput(streamOutput, type: .audio, sampleHandlerQueue: videoSampleBufferQueue)
+        if micInput != nil {
+            if #available(macOS 15.0, *) {
+                try stream.addStreamOutput(streamOutput, type: .microphone, sampleHandlerQueue: videoSampleBufferQueue)
+            }
+        }
     }
 
     func start() async throws {
-
         // Start capturing, wait for stream to start
         try await stream.startCapture()
 
@@ -193,45 +223,54 @@ struct ScreenRecorder {
     }
 
     func stop() async throws {
-
         // Stop capturing, wait for stream to stop
         try await stream.stopCapture()
 
         // End the AVAssetWriter session at last received sample
-        assetWriter.endSession(atSourceTime: streamOutput.lastSampleBuffer?.presentationTimeStamp ?? .zero)
+        assetWriter.endSession(atSourceTime: streamOutput.lastPresentationTime)
 
         // Finish writing
         videoInput.markAsFinished()
         audioInput.markAsFinished()
+        if let micInput = micInput { micInput.markAsFinished() }
         await assetWriter.finishWriting()
     }
 
     private class StreamOutput: NSObject, SCStreamOutput {
         let assetWriter: AVAssetWriter
         let videoInput: AVAssetWriterInput
-        let audioInput: AVAssetWriterInput
+        let audioInput: AVAssetWriterInput // system audio
+        let micInput: AVAssetWriterInput?  // mic track
         var sessionStarted = false
         private var baseTime: CMTime?
-        var lastSampleBuffer: CMSampleBuffer?
+        var lastPresentationTime: CMTime = .zero
 
-        init(assetWriter: AVAssetWriter, videoInput: AVAssetWriterInput, audioInput: AVAssetWriterInput) {
+        init(assetWriter: AVAssetWriter, videoInput: AVAssetWriterInput, audioInput: AVAssetWriterInput, micInput: AVAssetWriterInput?) {
             self.assetWriter = assetWriter
             self.videoInput = videoInput
             self.audioInput = audioInput
+            self.micInput = micInput
         }
 
         func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-
             // Return early if session hasn't started yet
             guard sessionStarted else { return }
 
             // Return early if the sample buffer is invalid
             guard sampleBuffer.isValid else { return }
 
-            // Start assetWriter session on first buffer (zero-copy)
-            if baseTime == nil {
-                baseTime = sampleBuffer.presentationTimeStamp
-                assetWriter.startSession(atSourceTime: baseTime!)
+            // Helper to create retimed buffer
+            func append(_ sb: CMSampleBuffer, to input: AVAssetWriterInput) {
+                guard input.isReadyForMoreMediaData else { return }
+                guard let base = baseTime else { return }
+                let newPTS = sb.presentationTimeStamp - base
+                var timing = CMSampleTimingInfo(duration: sb.duration,
+                                                presentationTimeStamp: newPTS,
+                                                decodeTimeStamp: sb.decodeTimeStamp)
+                if let retimed = try? CMSampleBuffer(copying: sb, withNewTiming: [timing]) {
+                    input.append(retimed)
+                    lastPresentationTime = newPTS
+                }
             }
 
             switch type {
@@ -244,14 +283,23 @@ struct ScreenRecorder {
                       status == .complete
                 else { return }
 
-                if videoInput.isReadyForMoreMediaData {
-                    videoInput.append(sampleBuffer)
-                    lastSampleBuffer = sampleBuffer // keep for endSession timing
+                // Start writer session on first complete video frame
+                if baseTime == nil {
+                    baseTime = sampleBuffer.presentationTimeStamp
+                    assetWriter.startSession(atSourceTime: .zero)
                 }
 
+                append(sampleBuffer, to: videoInput)
+
             case .audio:
-                if audioInput.isReadyForMoreMediaData {
-                    audioInput.append(sampleBuffer)
+                // Only process audio if video session has started
+                guard baseTime != nil else { return }
+                append(sampleBuffer, to: audioInput)
+
+            case .microphone where baseTime != nil:
+                // Handle microphone samples on macOS 15+ (only after video started)
+                if #available(macOS 15.0, *), let mic = micInput {
+                    append(sampleBuffer, to: mic)
                 }
 
             @unknown default:
